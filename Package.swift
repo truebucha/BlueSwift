@@ -11,8 +11,7 @@
      ],    
      targets: [
          .target(
-             name: "BlueSwift",
-             path: "Framework/Source Files"
+             name: "BlueSwift"
          ),
          .testTarget(name: "BlueSwiftTests",
                      dependencies: ["BlueSwift"],
