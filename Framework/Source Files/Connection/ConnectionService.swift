@@ -12,17 +12,46 @@ internal final class ConnectionService: NSObject {
     /// Closure used to check given peripheral against advertisement packet of discovered peripheral.
     internal var advertisementValidationHandler: ((Peripheral<Connectable>, String, [String: Any]) -> (Bool))? = { _,_,_ in return true }
 
+    /// Closure used to check given peripheral against advertisement packet of discovered peripheral.
+    internal var peripheralValidationHandler: ((Peripheral<Connectable>, CBPeripheral, [String: Any], NSNumber) -> (Bool))? = { _,_,_,_ in return true }
+
     /// Closure used to manage connection success or failure.
     internal var connectionHandler: ((Peripheral<Connectable>, ConnectionError?) -> ())?
-    
-    /// Returns the amount of devices already scheduled for connection.
+
+    /// Closure called when disconnecting a peripheral using `disconnect(_:)` is completed.
+    internal var peripheralConnectionCancelledHandler: ((Peripheral<Connectable>, CBPeripheral) -> ())?
+
+    /// Returns the amount of devices already connected.
     internal var connectedDevicesAmount: Int {
-        return peripherals.count
+        return peripherals.filter { $0.isConnected }.count
     }
+
+    /// Indicates whether connected devices limit has been exceeded.
+    internal var exceededDevicesConnectedLimit: Bool {
+        return connectedDevicesAmount >= deviceConnectionLimit
+    }
+
+    /// Current Bluetooth authorization status.
+    internal var bluetoothAuthorizationStatus: BluetoothAuthorizationStatus {
+        if #available(iOSApplicationExtension 13.1, *) {
+            return CBManager.authorization.bluetoothAuthorizationStatus
+        } else if #available(iOSApplicationExtension 13.0, *) {
+            return centralManager.authorization.bluetoothAuthorizationStatus
+        } else {
+            // Until iOS 12 applications could access Bluetooth without the user’s authorization
+            return .allowedAlways
+        }
+    }
+
+    /// Maximum amount of devices capable of connecting to a iOS device.
+    private let deviceConnectionLimit = 8
     
     /// Set of peripherals the manager should connect.
     private var peripherals = [Peripheral<Connectable>]()
-    
+
+    /// Handle to peripherals which were requested to disconnect.
+    private var peripheralsToDisconnect = [Peripheral<Connectable>]()
+
     private weak var connectingPeripheral: Peripheral<Connectable>?
     
     /// Connection options - means you will be notified on connection and disconnection of devices.
@@ -33,8 +62,13 @@ internal final class ConnectionService: NSObject {
     private lazy var scanningOptions = [CBCentralManagerScanOptionAllowDuplicatesKey : true]
     
     /// CBCentralManager instance. Allows peripheral connection.
-    private lazy var centralManager = CBCentralManager(delegate: self, queue: DispatchQueue.main, options: nil)
-    
+    /// iOS displays Bluetooth authorization popup when `CBCentralManager` is instantiated and authorization status is not determined.
+    private lazy var centralManager: CBCentralManager = {
+        let manager = CBCentralManager()
+        manager.delegate = self
+        return manager
+    }()
+
     /// Set of advertisement UUID central manager should scan for.
     private var scanParameters: Set<CBUUID> = Set()
 }
@@ -46,16 +80,41 @@ extension ConnectionService {
         if connectionHandler == nil {
             connectionHandler = handler
         }
-        peripherals.append(peripheral)
-        reloadScanning()
+        do {
+            try centralManager.validateState()
+            peripherals.append(peripheral)
+            reloadScanning()
+        } catch let error {
+            if let error = error as? BluetoothError {
+                handler(peripheral, .bluetoothError(error))
+            }
+        }
     }
     
     /// Disconnects given device.
     internal func disconnect(_ peripheral: CBPeripheral) {
-        if let index = peripherals.index(where: { $0.peripheral === peripheral }) {
-            peripherals.remove(at: index)
+        if let index = peripherals.firstIndex(where: { $0.peripheral === peripheral }) {
+            let peripheralToDisconnect = peripherals.remove(at: index)
+            peripheralsToDisconnect.append(peripheralToDisconnect)
         }
         centralManager.cancelPeripheralConnection(peripheral)
+    }
+
+    /// Function called to remove peripheral from queue
+    /// - Parameter peripheral: peripheral to remove.
+    internal func remove(_ peripheral: Peripheral<Connectable>) {
+        guard let index = peripherals.firstIndex(where: { $0 === peripheral }) else { return }
+        peripherals.remove(at: index)
+    }
+
+    /// Function called to stop scanning for devices.
+    internal func stopScanning() {
+        centralManager.stopScan()
+    }
+
+    /// Triggers showing Bluetooth authorization popup by instantiating the central manager.
+    internal func requestBluetoothAuthorization() {
+        _ = centralManager
     }
 }
 
@@ -76,6 +135,7 @@ private extension ConnectionService {
             return
         }
         scanParameters = Set(params)
+        guard case .poweredOn = centralManager.state else { return }
         centralManager.scanForPeripherals(withServices: Array(scanParameters), options: scanningOptions)
     }
     
@@ -83,7 +143,7 @@ private extension ConnectionService {
     /// deviceIdentifier was passed during initialization. If it's correctly retrieved, scanning is unnecessary and peripheral
     /// can be directly connected.
     private func performDeviceAutoReconnection() {
-        let identifiers = peripherals.compactMap { UUID(uuidString: $0.deviceIdentifier ?? "") }
+        let identifiers = peripherals.filter { !$0.isConnected }.compactMap { UUID(uuidString: $0.deviceIdentifier ?? "") }
         guard !identifiers.isEmpty else { return }
         let retrievedPeripherals = centralManager.retrievePeripherals(withIdentifiers: identifiers)
         let matching = peripherals.matchingElementsWith(retrievedPeripherals)
@@ -114,22 +174,27 @@ extension ConnectionService: CBCentralManagerDelegate {
     /// - SeeAlso: CBCentralManagerDelegate
     public func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
         let devices = peripherals.filter({ $0.configuration.matches(advertisement: advertisementData)})
-        guard let handler = advertisementValidationHandler,
-            let matchingPeripheral = devices.filter({ $0.peripheral == nil }).first,
-            handler(matchingPeripheral, peripheral.identifier.uuidString, advertisementData),
-            connectingPeripheral == nil
-            else {
-                return
+
+        guard let handler = peripheralValidationHandler,
+              let matchingPeripheral = devices.first(where: { $0.peripheral == nil }),
+              handler(matchingPeripheral, peripheral, advertisementData, RSSI),
+              connectingPeripheral == nil
+        else {
+            return
         }
         connectingPeripheral = matchingPeripheral
         connectingPeripheral?.peripheral = peripheral
+        connectingPeripheral?.rssi = RSSI
         central.connect(peripheral, options: connectionOptions)
+        if exceededDevicesConnectedLimit {
+            centralManager.stopScan()
+        }
     }
     
     /// Called upon a successfull peripheral connection.
     /// - SeeAlso: CBCentralManagerDelegate
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        guard let connectingPeripheral = peripherals.filter({ $0.peripheral === peripheral }).first else { return }
+        guard let connectingPeripheral = peripherals.first(withIdentical: peripheral) else { return }
         self.connectingPeripheral = connectingPeripheral
         connectingPeripheral.peripheral = peripheral
         peripheral.delegate = self
@@ -144,7 +209,7 @@ extension ConnectionService: CBCentralManagerDelegate {
 }
 
 extension ConnectionService: CBPeripheralDelegate {
-    
+
     /// Called upon discovery of services of a connected peripheral. Used to map model services to passed configuration and
     /// discover characteristics for each matching service.
     /// - SeeAlso: CBPeripheralDelegate
@@ -159,13 +224,13 @@ extension ConnectionService: CBPeripheralDelegate {
             peripheral.discoverCharacteristics(service.characteristics.map({ $0.bluetoothUUID }), for: cbService)
         })
     }
-    
+
     /// Called upon discovery of characteristics of a connected peripheral per each passed service. Used to map CBCharacteristic
     /// instances to passed configuration, assign characteristic raw values and setup notifications.
     /// - SeeAlso: CBPeripheralDelegate
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         guard let characteristics = service.characteristics, error == nil else { return }
-        let matchingService = connectingPeripheral?.configuration.services.filter({ $0.bluetoothUUID == service.uuid }).first
+        let matchingService = connectingPeripheral?.configuration.services.first(where: { $0.bluetoothUUID == service.uuid })
         let matchingCharacteristics = matchingService?.characteristics.matchingElementsWith(characteristics)
         guard matchingCharacteristics?.count != 0 else {
             centralManager.cancelPeripheralConnection(peripheral)
@@ -182,13 +247,26 @@ extension ConnectionService: CBPeripheralDelegate {
         }
         connectingPeripheral = nil
     }
-    
-    /// Called when device is disconnected, inside this method a device is reconnected. Connect method does not have a timeout
-    /// so connection will be triggered anytime in the future when the device is discovered. In case the connection is no
-    /// longer needed we'll just return.
+
+    /// Called when device is disconnected.
+    /// If connection was cancelled using `disconnect(_:)`, then `peripheralConnectionCancelledHandler(_:)` is called.
+    /// Otherwise device is reconnected. Connect method does not have a timeout, so connection will be triggered
+    /// anytime in the future when the device is discovered. In case the connection is no longer needed we'll just return.
     /// - SeeAlso: CBPeripheralDelegate
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        guard let disconnectedPeripheral = peripherals.filter({ $0.peripheral === peripheral }).first?.peripheral else { return }
-        centralManager.connect(disconnectedPeripheral, options: connectionOptions)
+        /// `error` is nil if disconnect resulted from a call to `cancelPeripheralConnection(_:)`.
+        /// SeeAlso: https://developer.apple.com/documentation/corebluetooth/cbcentralmanagerdelegate/1518791-centralmanager
+        if error == nil,
+           let disconnectedPeripheral = peripheralsToDisconnect.first(withIdentical: peripheral) {
+            peripheralsToDisconnect.removeAll(where: { $0 === disconnectedPeripheral })
+            peripheralConnectionCancelledHandler?(disconnectedPeripheral, peripheral)
+            return
+        }
+        
+        if let disconnectedPeripheral = peripherals.first(withIdentical: peripheral),
+           let nativePeripheral = disconnectedPeripheral.peripheral {
+            disconnectedPeripheral.disconnectionHandler?()
+            centralManager.connect(nativePeripheral, options: connectionOptions)
+        }
     }
 }
